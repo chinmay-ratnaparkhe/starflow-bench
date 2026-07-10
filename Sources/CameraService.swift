@@ -83,19 +83,26 @@ final class CameraService: NSObject, ObservableObject {
 
     /// Shot-to-shot cadence test: N sequential captures (RAW if available),
     /// each fired from the previous one's completion.
+    ///
+    /// v2: run 1 returned 0.008 s frames at 36 fps — the zero-shutter-lag ring
+    /// buffer was serving pre-captured auto-exposure frames. Now we verify the
+    /// device is ACTUALLY integrating ~1 s before firing, and log the device's
+    /// live exposure/ISO per frame alongside the EXIF value.
     func runCadence(frames: Int, iso: Float, raw: Bool, responsive: Bool) {
         guard sessionRunning, !cadenceRunning else { return }
         cadenceRunning = true
         framesWanted = frames
         framesDone = 0
         lastFinish = nil
-        testStart = Date()
         useRAW = raw
 
         if photoOutput.isResponsiveCaptureSupported {
             photoOutput.isResponsiveCaptureEnabled = responsive
         }
         if photoOutput.isZeroShutterLagSupported {
+            // ZSL serves buffered frames captured BEFORE the exposure lock —
+            // poison for a true-cadence measurement. Only allow it when the
+            // user explicitly tests the responsive path.
             photoOutput.isZeroShutterLagEnabled = responsive
         }
 
@@ -107,13 +114,29 @@ final class CameraService: NSObject, ObservableObject {
 
         csv = BenchLog.shared.newCSV(
             test: "cadence",
-            header: "frame,shot_to_shot_s,format,exposure_s,responsive,error")
-        csv?.row(["config", "", raw && rawAvailable ? "bayer_raw" : "heic",
-                  "", responsive ? "true" : "false",
-                  "maxExposure=\(device.map { CMTimeGetSeconds($0.activeFormat.maxExposureDuration) } ?? 0)"])
+            header: "frame,shot_to_shot_s,format,exif_exposure_s,device_exposure_s,device_iso,error")
+        csv?.row(["config", "", raw && rawAvailable ? "bayer_raw" : "heic", "",
+                  "responsive=\(responsive)",
+                  "maxExposure=\(device.map { CMTimeGetSeconds($0.activeFormat.maxExposureDuration) } ?? 0)",
+                  ""])
 
-        statusLine = "cadence: 0/\(frames)"
-        fireNext(rawTypes: rawTypes)
+        // Wait until the sensor is genuinely integrating near the target
+        // duration before the first capture (custom exposure takes effect
+        // asynchronously), then start the loop.
+        Task { @MainActor in
+            let deadline = Date().addingTimeInterval(3.0)
+            while Date() < deadline {
+                if let dev = self.device,
+                   CMTimeGetSeconds(dev.exposureDuration) > 0.5 { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            let applied = self.device.map { CMTimeGetSeconds($0.exposureDuration) } ?? 0
+            self.csv?.row(["exposure_applied", "", "", "",
+                           String(format: "%.3f", applied), "", applied < 0.5 ? "WARNING: custom exposure did not apply" : ""])
+            self.testStart = Date()
+            self.statusLine = "cadence: 0/\(frames)"
+            self.fireNext(rawTypes: rawTypes)
+        }
     }
 
     private func fireNext(rawTypes: [OSType]) {
@@ -135,11 +158,15 @@ final class CameraService: NSObject, ObservableObject {
         let delta = lastFinish.map { now.timeIntervalSince($0) }
         lastFinish = now
         framesDone += 1
+        let devExposure = device.map { CMTimeGetSeconds($0.exposureDuration) } ?? 0
+        let devISO = device?.iso ?? 0
         csv?.row(["\(framesDone)",
                   delta.map { String(format: "%.3f", $0) } ?? "",
                   useRAW ? "raw" : "heic",
                   exposureSeconds.map { String(format: "%.3f", $0) } ?? "",
-                  "", errorText ?? ""])
+                  String(format: "%.3f", devExposure),
+                  String(format: "%.0f", devISO),
+                  errorText ?? ""])
         statusLine = "cadence: \(framesDone)/\(framesWanted)"
 
         if framesDone < framesWanted && cadenceRunning {

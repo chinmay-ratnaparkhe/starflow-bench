@@ -67,21 +67,30 @@ struct ContentView: View {
             } else {
                 Text(runner.status).font(.caption).foregroundStyle(.secondary)
 
+                Text("Do NOT touch the gimbal trigger while tests run — it toggles motor authority. Press it only after all tests, watching the event log.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+
                 Button("1 · Capability probe (~30 s)") {
                     Task { await runner.runProbe() }
                 }
                 .disabled(!gimbal.isDocked)
 
+                Stepper("Seconds per rate: \(Int(slowSeconds))",
+                        value: $slowSeconds, in: 20...600, step: 20)
+                Button("2 · Velocity floor (0.05 → sidereal ↓)") {
+                    Task { await runner.runSlowVelocity(secondsPerRate: slowSeconds) }
+                }
+                .disabled(!gimbal.isDocked)
+
                 Stepper("Reps per step size: \(stepReps)", value: $stepReps, in: 3...50)
-                Button("2 · Relative-step ladder (2° → 0.02°)") {
+                Button("3 · Relative-step ladder (2° → 0.25°)") {
                     Task { await runner.runStepLadder(repsPerSize: stepReps) }
                 }
                 .disabled(!gimbal.isDocked)
 
-                Stepper("Seconds per rate: \(Int(slowSeconds))",
-                        value: $slowSeconds, in: 20...600, step: 20)
-                Button("3 · Slow-velocity ladder (sidereal ↑)") {
-                    Task { await runner.runSlowVelocity(secondsPerRate: slowSeconds) }
+                Button("4 · Velocity-impulse ladder (0.5° → 0.02°)") {
+                    Task { await runner.runImpulseLadder(repsPerSize: stepReps) }
                 }
                 .disabled(!gimbal.isDocked)
             }
@@ -97,7 +106,7 @@ struct ContentView: View {
             if camera.cadenceRunning {
                 Button("Abort cadence", role: .destructive) { camera.abortCadence() }
             } else {
-                Button("4 · Run cadence (1 s subs @ ISO 1600)") {
+                Button("5 · Run cadence (1 s subs @ ISO 1600)") {
                     camera.runCadence(frames: cadenceFrames, iso: 1600,
                                       raw: cadenceRAW, responsive: cadenceResponsive)
                 }

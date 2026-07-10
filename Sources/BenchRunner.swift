@@ -90,25 +90,33 @@ final class BenchRunner: ObservableObject {
     func runStepLadder(repsPerSize: Int) async {
         guard !running else { return }
         running = true
-        let sizes: [Double] = [2.0, 1.0, 0.5, 0.25, 0.1, 0.05, 0.02]   // degrees
-        let axes = ["yaw", "pitch"]
+        // v2: run 1 explored the 2° -> 0.02° decade and found 2° works while 1°
+        // no-ops — so v2 maps the 2° -> 0.25° region finely. Pitch keeps a short
+        // ladder (its DockKit envelope is only −38°..+28°).
+        let yawSizes: [Double] = [2.0, 1.5, 1.2, 1.0, 0.75, 0.5, 0.25]
+        let pitchSizes: [Double] = [2.0, 1.0, 0.5]
         let csv = BenchLog.shared.newCSV(
             test: "stepladder",
-            header: "axis,commanded_deg,rep,realized_deg,settle_s,error")
+            header: "axis,commanded_deg,rep,before_deg,after_deg,realized_deg,settle_s,error")
         defer { csv.close() }
 
-        let total = Double(sizes.count * axes.count * repsPerSize)
+        let total = Double((yawSizes.count + pitchSizes.count) * repsPerSize)
         var done = 0.0
 
-        for axis in axes {
+        for (axis, sizes) in [("yaw", yawSizes), ("pitch", pitchSizes)] {
             for size in sizes {
                 for rep in 0..<repsPerSize {
                     guard running else { await finish("step ladder: aborted"); return }
                     status = "steps: \(axis) \(size)° rep \(rep + 1)/\(repsPerSize)"
+                    // Ride out transient undock/redock cycles instead of burning reps.
+                    if !(await gimbal.waitForDock()) {
+                        csv.row([axis, String(format: "%.3f", size), "\(rep)",
+                                 "", "", "", "", "redock timeout"])
+                        continue
+                    }
                     // Alternate direction so we stay near the start pose.
                     let signed = (rep % 2 == 0) ? size : -size
-                    let before = await gimbal.averagePosition(seconds: 0.4)
-                    let t0 = Date()
+                    let before = await gimbal.averagePosition(seconds: 0.5)
                     do {
                         if axis == "yaw" {
                             try await gimbal.relativeMove(yawDeg: signed, seconds: 0.6)
@@ -116,18 +124,19 @@ final class BenchRunner: ObservableObject {
                             try await gimbal.relativeMove(pitchDeg: signed, seconds: 0.6)
                         }
                         let settle = await gimbal.waitSettled()
-                        let after = await gimbal.averagePosition(seconds: 0.4)
-                        let realizedRad = axis == "yaw" ? after.1 - before.1 : after.0 - before.0
-                        let realizedDeg = realizedRad * 180 / .pi
+                        let after = await gimbal.averagePosition(seconds: 0.5)
+                        let beforeDeg = (axis == "yaw" ? before.1 : before.0) * 180 / .pi
+                        let afterDeg = (axis == "yaw" ? after.1 : after.0) * 180 / .pi
                         let settleStr = settle.map { String(format: "%.2f", $0) } ?? "timeout"
                         csv.row([axis, String(format: "%.3f", signed), "\(rep)",
-                                 String(format: "%.5f", realizedDeg), settleStr, ""])
-                        _ = t0
+                                 String(format: "%.5f", beforeDeg),
+                                 String(format: "%.5f", afterDeg),
+                                 String(format: "%.5f", afterDeg - beforeDeg),
+                                 settleStr, ""])
                     } catch {
-                        csv.row([axis, String(format: "%.3f", signed), "\(rep)", "", "",
-                                 error.localizedDescription])
+                        csv.row([axis, String(format: "%.3f", signed), "\(rep)",
+                                 "", "", "", "", error.localizedDescription])
                         gimbal.log("step \(axis) \(signed)°: \(error.localizedDescription)")
-                        // Respect the documented 2 calls/s cap if we hit frameRateTooHigh.
                         try? await Task.sleep(nanoseconds: 700_000_000)
                     }
                     done += 1
@@ -138,13 +147,70 @@ final class BenchRunner: ObservableObject {
         await finish("step ladder: done → \(csv.url.lastPathComponent)")
     }
 
+    // MARK: - Test 2b: velocity-impulse ladder (fine-nudge candidate)
+
+    /// Fine moves as timed velocity pulses (angle = rate x seconds). Run 1
+    /// proved 0.05 rad/s velocity is accurate to <1%, while small
+    /// setOrientation steps dead-banded — this measures the pulse alternative.
+    func runImpulseLadder(repsPerSize: Int) async {
+        guard !running else { return }
+        running = true
+        // (target degrees, rate rad/s) — durations stay >= 35 ms.
+        let targets: [(Double, Double)] = [
+            (0.5, 0.05), (0.25, 0.05), (0.1, 0.05), (0.05, 0.02), (0.02, 0.01),
+        ]
+        let csv = BenchLog.shared.newCSV(
+            test: "impulseladder",
+            header: "target_deg,rate_rad_s,pulse_s,rep,realized_deg,settle_s,error")
+        defer { csv.close() }
+
+        let total = Double(targets.count * repsPerSize)
+        var done = 0.0
+
+        for (targetDeg, rate) in targets {
+            let pulse = (targetDeg * .pi / 180) / rate
+            for rep in 0..<repsPerSize {
+                guard running else { await finish("impulse ladder: aborted"); return }
+                status = String(format: "impulse: %.2f° (%.0f ms) rep %d/%d",
+                                targetDeg, pulse * 1000, rep + 1, repsPerSize)
+                if !(await gimbal.waitForDock()) {
+                    csv.row([String(format: "%.3f", targetDeg), "\(rate)",
+                             String(format: "%.3f", pulse), "\(rep)", "", "", "redock timeout"])
+                    continue
+                }
+                let sign: Double = (rep % 2 == 0) ? 1 : -1
+                let before = await gimbal.averagePosition(seconds: 0.5)
+                do {
+                    try await gimbal.velocityPulse(yawRadPerSec: rate * sign, seconds: pulse)
+                    let settle = await gimbal.waitSettled()
+                    let after = await gimbal.averagePosition(seconds: 0.5)
+                    let realized = (after.1 - before.1) * 180 / .pi
+                    csv.row([String(format: "%.3f", targetDeg * sign), "\(rate)",
+                             String(format: "%.3f", pulse), "\(rep)",
+                             String(format: "%.5f", realized),
+                             settle.map { String(format: "%.2f", $0) } ?? "timeout", ""])
+                } catch {
+                    csv.row([String(format: "%.3f", targetDeg * sign), "\(rate)",
+                             String(format: "%.3f", pulse), "\(rep)", "", "",
+                             error.localizedDescription])
+                }
+                done += 1
+                progress = done / total
+            }
+        }
+        await finish("impulse ladder: done → \(csv.url.lastPathComponent)")
+    }
+
     // MARK: - Test 3: slow-velocity ladder (sidereal probe)
 
     func runSlowVelocity(secondsPerRate: Double) async {
         guard !running else { return }
         running = true
-        // Sidereal = 7.27e-5 rad/s. Ladder up from there.
-        let rates: [Double] = [7.27e-5, 1.45e-4, 3.64e-4, 7.27e-4, 3.64e-3]
+        // v2: DESCEND from the proven-working 0.05 rad/s to find the floor.
+        // Run 1's all-rejected result was ambiguous (possible authority loss);
+        // starting from a known-good rate disambiguates: if 0.05 works and
+        // 7.27e-5 errors, the rejection is a real velocity floor.
+        let rates: [Double] = [0.05, 0.02, 0.01, 0.005, 0.002, 7.27e-4, 3.64e-4, 7.27e-5]
         let csv = BenchLog.shared.newCSV(
             test: "slowvelocity",
             header: "commanded_rad_s,elapsed_s,yaw_deg_moved,achieved_rad_s,samples")
@@ -157,6 +223,10 @@ final class BenchRunner: ObservableObject {
         for (i, rate) in rates.enumerated() {
             guard running else { await finish("slow velocity: aborted"); return }
             status = String(format: "velocity: %.2e rad/s for %.0f s", rate, secondsPerRate)
+            if !(await gimbal.waitForDock()) {
+                csv.row([String(format: "%.3e", rate), "0", "", "", "redock timeout"])
+                continue
+            }
             let before = await gimbal.averagePosition(seconds: 0.5)
             gimbal.startRecording()
             do {

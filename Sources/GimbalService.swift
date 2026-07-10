@@ -49,6 +49,11 @@ final class GimbalService: ObservableObject {
     private var recording = false
     private(set) var recorded: [MotionSample] = []
 
+    /// Persistent session log: every dock/undock/error/event lands in a CSV so
+    /// post-run analysis can correlate test rows with connection instability.
+    private lazy var sessionCSV = BenchLog.shared.newCSV(
+        test: "session", header: "timestamp,event")
+
     private init() {}
 
     func start() {
@@ -173,20 +178,26 @@ final class GimbalService: ObservableObject {
         return recorded
     }
 
-    /// Waits until all axis speeds stay below `threshold` rad/s for `stableFor`
-    /// seconds. Returns the time in seconds it took to settle, or nil on timeout.
-    func waitSettled(threshold: Double = 2e-4, stableFor: Double = 0.3,
+    /// Waits until the accessory reports quiet motion. The encoder feed runs at
+    /// only ~4 Hz, so we require `quietSamples` consecutive FRESH samples below
+    /// `threshold` (first run's 0.01 s "settles" were stale-sample artifacts).
+    /// Returns seconds until settled, or nil on timeout.
+    func waitSettled(threshold: Double = 2e-4, quietSamples: Int = 3,
                      timeout: Double = 6.0) async -> Double? {
         let start = Date()
-        var stableSince: Date?
+        var lastSampleWall: TimeInterval = latestMotion?.wall ?? 0
+        var quiet = 0
         while Date().timeIntervalSince(start) < timeout {
-            if let m = latestMotion, m.speedMagnitude < threshold {
-                if stableSince == nil { stableSince = Date() }
-                if Date().timeIntervalSince(stableSince!) >= stableFor {
-                    return Date().timeIntervalSince(start) - stableFor
+            if let m = latestMotion, m.wall > lastSampleWall {
+                lastSampleWall = m.wall
+                if m.speedMagnitude < threshold {
+                    quiet += 1
+                    if quiet >= quietSamples {
+                        return Date().timeIntervalSince(start)
+                    }
+                } else {
+                    quiet = 0
                 }
-            } else {
-                stableSince = nil
             }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
@@ -208,9 +219,34 @@ final class GimbalService: ObservableObject {
                 samples.map(\.2).reduce(0, +) / n)
     }
 
+    /// Waits (up to `timeout`) for the accessory to be docked and commandable.
+    /// Used by tests to ride out transient undock/redock cycles instead of
+    /// burning measurement reps.
+    func waitForDock(timeout: Double = 25.0) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < timeout {
+            if isDocked, accessory != nil { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return isDocked && accessory != nil
+    }
+
+    /// Fine move via a timed velocity pulse: rate * seconds = angle. Verified
+    /// accurate at 0.05 rad/s in the first bench run, unlike small
+    /// setOrientation steps which showed a ~1 degree deadband.
+    func velocityPulse(yawRadPerSec: Double = 0, pitchRadPerSec: Double = 0,
+                       seconds: Double) async throws {
+        guard let acc = accessory else { throw BenchError.notDocked }
+        try await acc.setAngularVelocity(
+            Vector3D(x: pitchRadPerSec, y: yawRadPerSec, z: 0))
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        try? await acc.setAngularVelocity(Vector3D(x: 0, y: 0, z: 0))
+    }
+
     func log(_ line: String) {
         let stamp = ISO8601DateFormatter().string(from: Date())
         eventLines.append("\(stamp)  \(line)")
         if eventLines.count > 400 { eventLines.removeFirst(eventLines.count - 400) }
+        sessionCSV.row([stamp, line])
     }
 }
