@@ -11,6 +11,9 @@ struct ContentView: View {
     @State private var cadenceRAW = true
     @State private var cadenceResponsive = true
     @State private var logFiles: [URL] = []
+    @State private var autoCountdown: Int?
+    @State private var autoArmedOnce = false
+    @State private var countdownTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -26,6 +29,21 @@ struct ContentView: View {
                 gimbal.start()
                 await camera.requestAndStart()
                 logFiles = BenchLog.shared.listFiles()
+            }
+            .onChange(of: gimbal.isDocked) { _, docked in
+                // Hands-free end-to-end mode: once per launch, when the gimbal
+                // docks, count down and run the entire suite automatically.
+                guard docked, !autoArmedOnce, !runner.suiteRunning else { return }
+                autoArmedOnce = true
+                countdownTask = Task {
+                    for remaining in stride(from: 15, through: 1, by: -1) {
+                        autoCountdown = remaining
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        if Task.isCancelled { autoCountdown = nil; return }
+                    }
+                    autoCountdown = nil
+                    await runner.runFullSuite()
+                }
             }
             .safeAreaInset(edge: .bottom) { stopBar }
         }
@@ -58,13 +76,37 @@ struct ContentView: View {
 
     private var testsSection: some View {
         Section("Gimbal tests (run in order)") {
-            if runner.running {
+            if let c = autoCountdown {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("AUTO-RUN: full bench starts in \(c) s…")
+                        .font(.headline).foregroundStyle(.green)
+                    Text("Hands off the gimbal and trigger. ~15 min total.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button("Cancel auto-run", role: .destructive) {
+                    countdownTask?.cancel()
+                    autoCountdown = nil
+                }
+            }
+            if runner.suiteRunning {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("FULL BENCH RUNNING — \(runner.status)").font(.callout)
+                    ProgressView(value: runner.progress)
+                }
+                Button("Abort full bench", role: .destructive) { runner.abortSuite() }
+            } else if autoCountdown == nil {
+                Button("▶ Run FULL bench now (auto, ~15 min)") {
+                    Task { await runner.runFullSuite() }
+                }
+                .disabled(!gimbal.isDocked || runner.running)
+            }
+            if runner.running && !runner.suiteRunning {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(runner.status).font(.callout)
                     ProgressView(value: runner.progress)
                 }
                 Button("Abort test", role: .destructive) { runner.abort() }
-            } else {
+            } else if !runner.suiteRunning {
                 Text(runner.status).font(.caption).foregroundStyle(.secondary)
 
                 Text("Do NOT touch the gimbal trigger while tests run — it toggles motor authority. Press it only after all tests, watching the event log.")

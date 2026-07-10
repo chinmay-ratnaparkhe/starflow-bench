@@ -10,10 +10,41 @@ final class BenchRunner: ObservableObject {
     @Published var running = false
     @Published var status = "idle"
     @Published var progress: Double = 0
+    @Published var suiteRunning = false
 
     private let gimbal = GimbalService.shared
 
     private init() {}
+
+    // MARK: - Full automated suite (end-to-end, one tap / auto-armed)
+
+    func runFullSuite() async {
+        guard !suiteRunning, !running else { return }
+        suiteRunning = true
+        gimbal.log("FULL BENCH START")
+        await runProbe()
+        if suiteRunning { await runSlowVelocity(secondsPerRate: 20) }
+        if suiteRunning { await runStepLadder(repsPerSize: 6) }
+        if suiteRunning { await runImpulseLadder(repsPerSize: 6) }
+        if suiteRunning {
+            gimbal.log("cadence: starting (ZSL off, true 1 s)")
+            let cam = CameraService.shared
+            cam.runCadence(frames: 50, iso: 1600, raw: true, responsive: false)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            while cam.cadenceRunning && suiteRunning {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            gimbal.log("cadence: \(cam.statusLine)")
+        }
+        gimbal.log(suiteRunning ? "FULL BENCH DONE" : "FULL BENCH ABORTED")
+        suiteRunning = false
+    }
+
+    func abortSuite() {
+        suiteRunning = false
+        abort()
+        CameraService.shared.abortCadence()
+    }
 
     private func finish(_ message: String) async {
         await gimbal.zeroVelocity()
