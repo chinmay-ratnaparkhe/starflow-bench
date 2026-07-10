@@ -1,0 +1,45 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build archive (unsigned)
+        run: |
+          xcodebuild \
+            -project StarFlowBench.xcodeproj \
+            -scheme StarFlowBench \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/StarFlowBench.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir -p build/Payload
+          cp -R "build/StarFlowBench.xcarchive/Products/Applications/StarFlowBench.app" build/Payload/
+          cd build
+          zip -qr StarFlowBench.ipa Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarFlowBench-ipa
+          path: build/StarFlowBench.ipa
+          retention-days: 30
