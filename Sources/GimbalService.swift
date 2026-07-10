@@ -88,7 +88,7 @@ final class GimbalService: ObservableObject {
         accessory = acc
         isDocked = true
         accessoryDescription = String(describing: acc)
-        limitsDescription = String(describing: acc.limits)
+        limitsDescription = (try? acc.limits).map { String(describing: $0) } ?? "unavailable"
         disableSystemTracking()
         startMotionFeed(acc)
         startEventFeed(acc)
@@ -109,7 +109,7 @@ final class GimbalService: ObservableObject {
         motionTask?.cancel()
         motionTask = Task {
             do {
-                for try await state in acc.motionStates {
+                for try await state in try acc.motionStates {
                     let sample = MotionSample(
                         t: state.timestamp,
                         wall: Date().timeIntervalSince1970,
@@ -132,7 +132,7 @@ final class GimbalService: ObservableObject {
         eventsTask?.cancel()
         eventsTask = Task {
             do {
-                for try await event in acc.accessoryEvents {
+                for try await event in try acc.accessoryEvents {
                     self.log("EVENT \(String(describing: event))")
                 }
             } catch {
